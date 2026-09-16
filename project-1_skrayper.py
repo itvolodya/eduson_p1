@@ -25,6 +25,7 @@ PERIOD_OPTIONS = {
     "6": ("All time", None)
 }
 
+# Извлекает числовой идентификатор приложения из ссылки App Store.
 def extract_app_id(url):
     """Извлекает app_id из URL приложения"""
     match = re.search(r"/id(\d+)", url) or re.search(r"[?&]id=(\d+)", url)
@@ -33,12 +34,15 @@ def extract_app_id(url):
         return None
     return match.group(1)
 
+# Определяет код страны App Store: сначала используется ввод пользователя,
+# а при его отсутствии берется код из URL.
 def get_storefront(url, user_input):
     """Определяет витрину с учетом пользовательского ввода"""
     parts = [p for p in urlparse(url).path.split("/") if p]
     from_url = next((p for p in parts if len(p) == 2 and p.isalpha()), "us")
     return user_input.lower() if user_input else from_url
 
+# Запрашивает свежие отзывы из официального RSS-источника Apple.
 def fetch_rss_reviews(session, app_id, storefront):
     """Получает отзывы через RSS API"""
     url = f"{RSS_HOST}/{storefront}/rss/customerreviews/id={app_id}/sortBy=mostRecent/json"
@@ -51,6 +55,7 @@ def fetch_rss_reviews(session, app_id, storefront):
         st.warning(f"⚠️ RSS feed unavailable: {str(e)}")
         return []
 
+    # Загружает HTML страницы приложения и извлекает отзывы из встроенных JSON-данных.
 def fetch_page_reviews(session, app_id, storefront):
     """Резервный метод: парсит страницу приложения"""
     url = PAGE_URL.format(storefront=storefront, app_id=app_id)
@@ -71,6 +76,7 @@ def fetch_page_reviews(session, app_id, storefront):
         st.error(f"❌ Failed to parse page: {str(e)}")
         return []
 
+# Приводит отзывы из разных источников к единому формату таблицы.
 def process_reviews(raw_reviews, app_id, storefront, days_limit=None):
     """Обрабатывает сырые отзывы в DataFrame"""
     columns = [
@@ -78,24 +84,30 @@ def process_reviews(raw_reviews, app_id, storefront, days_limit=None):
         'title', 'content', 'date', 'date_parsed', 'source'
     ]
     reviews = []
+
+    # Ограничивает выдачу выбранным периодом; для режима All time ограничение не задается.
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_limit) if days_limit else None
     
     for item in raw_reviews:
+        # Отдельные источники могут вернуть строку или другой объект вместо отзыва-словаря.
         if not isinstance(item, Mapping):
             st.warning(f"Skipping malformed review: expected an object, got {type(item).__name__}")
             continue
 
         try:
+            # RSS и данные страницы используют разные форматы даты, поэтому поддерживаются оба.
             updated = item.get('updated', {})
             date_str = (updated.get('label', '') if isinstance(updated, Mapping) else updated) or item.get('date', '')
             date = datetime.fromisoformat(date_str.replace('Z', '+00:00')) if date_str else None
 
+            # Сохраняем поля до преобразования, чтобы безопасно обработать RSS-объекты и строки.
             review_id = item.get('id', {})
             author = item.get('author', {})
             rating = item.get('im:rating', {})
             title = item.get('title', {})
             content = item.get('content', {})
 
+            # Возвращает текст из RSS-объекта или обычное значение из данных страницы.
             def label_or_value(value, fallback=''):
                 if isinstance(value, Mapping):
                     return value.get('label', fallback)
@@ -119,9 +131,10 @@ def process_reviews(raw_reviews, app_id, storefront, days_limit=None):
         except Exception as e:
             st.warning(f"Skipping malformed review: {str(e)}")
     
+    # Явно задаем колонки, чтобы пустой результат тоже можно было безопасно сортировать.
     return pd.DataFrame(reviews, columns=columns).sort_values('date_parsed', ascending=False)
 
-# Интерфейс
+# Формирует интерфейс Streamlit и запускает сбор отзывов после нажатия кнопки.
 def main():
     st.title("📱 App Store Reviews Collector")
     st.markdown("""
@@ -130,6 +143,7 @@ def main():
     """)
     
     with st.sidebar:
+        # Боковая панель содержит ссылку приложения, витрину и период поиска.
         st.header("Settings")
         app_url = st.text_input("App Store URL", 
             placeholder="https://apps.apple.com/us/app/telegram-messenger/id686449807",
@@ -145,12 +159,13 @@ def main():
             index=3)  # Default to "All time"
     
     if st.button("🚀 Collect Reviews", type="primary"):
+        # Проверяем обязательную ссылку до выполнения сетевых запросов.
         if not app_url:
             st.warning("Please enter an App Store URL")
             return
             
         with st.spinner("Processing..."):
-            # Извлекаем параметры
+            # Извлекаем идентификатор приложения и код страны из пользовательских данных.
             app_id = extract_app_id(app_url)
             if not app_id:
                 return
@@ -158,23 +173,24 @@ def main():
             storefront = get_storefront(app_url, custom_storefront)
             days_limit = PERIOD_OPTIONS[period][1]
             
-            # Собираем данные
+            # Создаем HTTP-сессию с браузерным User-Agent для запросов к Apple.
             session = requests.Session()
             session.headers.update(HEADERS)
             
             st.info(f"🔎 Checking app ID: {app_id} (storefront: {storefront})")
             
-            # Пробуем оба источника
+            # Сначала используем RSS, а страницу запрашиваем только при пустом RSS-ответе.
             rss_reviews = fetch_rss_reviews(session, app_id, storefront)
             page_reviews = [] if rss_reviews else fetch_page_reviews(session, app_id, storefront)
             
-            # Обрабатываем результат
+            # Объединяем результаты и приводим их к единой таблице.
             df = process_reviews(rss_reviews + page_reviews, app_id, storefront, days_limit)
             
             if not df.empty:
+                # Показываем собранные отзывы и количество записей из каждого источника.
                 st.success(f"✅ Collected {len(df)} reviews ({len(rss_reviews)} from RSS, {len(page_reviews)} from page)")
                 
-                # Показываем таблицу
+                # Отображаем основные поля отзыва в интерактивной таблице.
                 st.dataframe(df[['author', 'rating', 'title', 'date', 'source']], 
                             height=400,
                             column_config={
@@ -182,7 +198,7 @@ def main():
                                 'date': st.column_config.DatetimeColumn()
                             })
                 
-                # Кнопка скачивания
+                # Подготавливаем CSV-кодировку, совместимую с Excel, и добавляем скачивание.
                 csv = df.to_csv(index=False).encode('utf-8-sig')  # Для Excel
                 st.download_button(
                     label="📥 Download CSV",
@@ -191,7 +207,7 @@ def main():
                     mime="text/csv"
                 )
                 
-                # Дополнительная аналитика
+                # Показываем сводные показатели и распределение оценок.
                 with st.expander("📊 Statistics"):
                     col1, col2 = st.columns(2)
                     with col1:
@@ -203,6 +219,7 @@ def main():
                     
                     st.bar_chart(df['rating'].value_counts().sort_index(), height=200)
             else:
+                # Объясняем пользователю типичные причины отсутствия результатов.
                 st.error("No reviews found. Possible reasons:")
                 st.markdown("""
                 - The app has no reviews in selected region
