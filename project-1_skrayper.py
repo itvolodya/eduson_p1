@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 import re
 import json
+from collections.abc import Mapping
 
 # Конфигурация
 st.set_page_config(page_title="App Store Reviews Collector", layout="wide")
@@ -72,13 +73,33 @@ def fetch_page_reviews(session, app_id, storefront):
 
 def process_reviews(raw_reviews, app_id, storefront, days_limit=None):
     """Обрабатывает сырые отзывы в DataFrame"""
+    columns = [
+        'app_id', 'storefront', 'review_id', 'author', 'rating',
+        'title', 'content', 'date', 'date_parsed', 'source'
+    ]
     reviews = []
     cutoff = datetime.now(timezone.utc) - timedelta(days=days_limit) if days_limit else None
     
     for item in raw_reviews:
+        if not isinstance(item, Mapping):
+            st.warning(f"Skipping malformed review: expected an object, got {type(item).__name__}")
+            continue
+
         try:
-            date_str = item.get('updated', {}).get('label', '') or item.get('date', '')
+            updated = item.get('updated', {})
+            date_str = (updated.get('label', '') if isinstance(updated, Mapping) else updated) or item.get('date', '')
             date = datetime.fromisoformat(date_str.replace('Z', '+00:00')) if date_str else None
+
+            review_id = item.get('id', {})
+            author = item.get('author', {})
+            rating = item.get('im:rating', {})
+            title = item.get('title', {})
+            content = item.get('content', {})
+
+            def label_or_value(value, fallback=''):
+                if isinstance(value, Mapping):
+                    return value.get('label', fallback)
+                return value or fallback
             
             if cutoff and date and date < cutoff:
                 continue
@@ -86,11 +107,11 @@ def process_reviews(raw_reviews, app_id, storefront, days_limit=None):
             reviews.append({
                 'app_id': app_id,
                 'storefront': storefront,
-                'review_id': item.get('id', {}).get('label', '') or str(item.get('id', '')),
-                'author': item.get('author', {}).get('name', {}).get('label', '') or item.get('reviewerName', ''),
-                'rating': item.get('im:rating', {}).get('label', '') or str(item.get('rating', '')),
-                'title': item.get('title', {}).get('label', '') or item.get('title', ''),
-                'content': item.get('content', {}).get('label', '') or item.get('contents', ''),
+                'review_id': label_or_value(review_id, str(review_id) if review_id else ''),
+                'author': label_or_value(author.get('name', {}) if isinstance(author, Mapping) else author) or item.get('reviewerName', ''),
+                'rating': label_or_value(rating, str(item.get('rating', ''))),
+                'title': label_or_value(title) or item.get('title', ''),
+                'content': label_or_value(content) or item.get('contents', ''),
                 'date': date_str,
                 'date_parsed': date,
                 'source': 'RSS' if 'im:rating' in item else 'Page'
@@ -98,7 +119,7 @@ def process_reviews(raw_reviews, app_id, storefront, days_limit=None):
         except Exception as e:
             st.warning(f"Skipping malformed review: {str(e)}")
     
-    return pd.DataFrame(reviews).sort_values('date_parsed', ascending=False)
+    return pd.DataFrame(reviews, columns=columns).sort_values('date_parsed', ascending=False)
 
 # Интерфейс
 def main():
